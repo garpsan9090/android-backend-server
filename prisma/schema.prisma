@@ -1,0 +1,177 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                 String        @id
+  username           String        @unique
+  email              String        @unique
+  password           String
+  balance            Float         @default(0)
+  registrationNumber String?
+  website            String        @default("default")
+  referralCode       String?       @unique
+  referredById       String?
+  referralBonusPaid  Boolean       @default(false)
+  referralBonusEarned Float        @default(0)
+  referralCount      Int           @default(0)
+  twoFactorEnabled   Boolean       @default(false)
+  twoFactorSecret    String?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  legacyId           String?       @unique
+  phoneNumber        String?       @unique
+  BankAccount        BankAccount[]
+  sessions           Session[]
+  transactions       Transaction[]
+  referredBy         User?         @relation("ReferredUsers", fields: [referredById], references: [id])
+  referrals          User[]        @relation("ReferredUsers")
+}
+
+model Session {
+  id        String   @id
+  token     String   @unique
+  email     String
+  userId    String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  legacyId  String?  @unique
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([userId], map: "Session_userId_fkey")
+}
+
+model Admin {
+  id               String   @id
+  username         String   @unique
+  password         String
+  secretKey        String   @unique
+  twoFactorEnabled Boolean  @default(false)
+  twoFactorSecret  String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Transaction {
+  id                    String              @id
+  userId                String
+  type                  String
+  amount                Float
+  status                String              @default("pending")
+  paymentMethod         String?
+  transactionId         String?             @unique
+  razorpayOrderId       String?
+  razorpayPaymentId     String?
+  bankAccountId         String?
+  proofUrl              String?
+  utrNumber             String?
+  verificationStatus    String?             @default("pending")
+  verifiedBy            String?
+  verificationNotes     String?
+  upiId                 String?
+  investmentPlanId      String?
+  investmentName        String
+  investmentDuration    String?
+  investmentDurationDays Int?
+  returnPercent         Float?
+  expectedReturn        Float?
+  totalProfit           Float?
+  dailyProfit           Float?
+  investmentDetails     String?             @db.Text
+  investmentStatus      String?             @default("Active")
+  investmentStartAt     DateTime?
+  investmentEndAt       DateTime?
+  workingDays           Int?
+  creditedEarnings      Float?              @default(0)
+  completedAt           DateTime?
+  referenceTxnId        String?
+  reinvestedFromId      String?
+  description           String?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  legacyId              String?             @unique
+  investmentId          String?
+  BankAccount           BankAccount?        @relation(fields: [bankAccountId], references: [id])
+  user                  User                @relation(fields: [userId], references: [id])
+  investmentEarnings    InvestmentEarning[]
+
+  @@index([bankAccountId], map: "Transaction_bankAccountId_fkey")
+  @@index([userId], map: "Transaction_userId_fkey")
+}
+
+model InvestmentEarning {
+  id           String      @id
+  investmentId String
+  transaction  Transaction @relation(fields: [investmentId], references: [id])
+  amount       Float
+  creditedAt   DateTime
+  claimedAt    DateTime?
+  status       String      @default("unclaimed")
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([investmentId])
+  @@index([creditedAt])
+  @@unique([investmentId, creditedAt])
+}
+
+model Holiday {
+  id        String   @id
+  date      DateTime @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BankAccount {
+  id                String        @id
+  userId            String
+  accountHolderName String
+  accountNumber     String
+  ifscCode          String
+  bankName          String?
+  branchName        String?
+  isVerified        Boolean       @default(false)
+  createdAt         DateTime      @default(now())
+  legacyId          String?       @unique
+  User              User          @relation(fields: [userId], references: [id])
+  Transaction       Transaction[]
+
+  @@index([userId], map: "BankAccount_userId_fkey")
+}
+
+model DepositSetting {
+  id                 String   @id
+  key                String   @unique @default("default")
+  upiId              String?
+  bankAccountHolder  String?
+  bankAccountNumber  String?
+  bankIfsc           String?
+  bankName           String?
+  bankBranch         String?
+  instructions       String?
+  updatedAt          DateTime
+  createdAt          DateTime @default(now())
+  qrCodePath         String?
+}
+
+model OTP {
+  id        String   @id
+  email     String
+  otp       String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  verified  Boolean  @default(false)
+  legacyId  String?  @unique
+  attempts  Int      @default(0)
+  purpose   String?  @default("signup")
+
+  @@index([email, purpose])
+  @@index([expiresAt])
+}

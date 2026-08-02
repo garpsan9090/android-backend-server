@@ -1,12 +1,26 @@
 const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '..', '.env.local') });
+const fs = require('fs');
+const dotenv = require('dotenv');
+const envCandidates = [
+  path.resolve(__dirname, '.env.local'),
+  path.resolve(__dirname, '.env'),
+  path.resolve(__dirname, '..', '.env.local'),
+  path.resolve(__dirname, '..', '.env'),
+];
+
+for (const envPath of envCandidates) {
+  if (fs.existsSync(envPath)) {
+    dotenv.config({ path: envPath });
+    break;
+  }
+}
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const cron = require('node-cron');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
-const fs = require('fs');
 const { prisma } = require('./prisma');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
