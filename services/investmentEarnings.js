@@ -1,0 +1,243 @@
+const crypto = require('crypto');
+const { prisma } = require('../prisma');
+
+function createId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function roundToTwo(value) {
+  return Number(Number(value || 0).toFixed(2));
+}
+
+function toIndiaMidnight(date) {
+  const dt = new Date(date);
+  const indiaDate = dt.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  return new Date(`${indiaDate}T00:00:00+05:30`);
+}
+
+function addIndiaDays(date, days) {
+  const result = new Date(date);
+  result.setTime(result.getTime() + days * 24 * 60 * 60 * 1000);
+  return result;
+}
+
+function isIndiaWeekend(date) {
+  const weekday = new Date(date).toLocaleString('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' });
+  return weekday === 'Sat' || weekday === 'Sun';
+}
+
+async function getHolidaysInRange(startDate, endDate) {
+  const start = toIndiaMidnight(startDate);
+  const end = toIndiaMidnight(endDate);
+  const holidays = await prisma.holiday.findMany({
+    where: {
+      date: {
+        gte: start,
+        lt: addIndiaDays(end, 1),
+      },
+    },
+  });
+  return new Set(holidays.map((holiday) => toIndiaMidnight(holiday.date).getTime()));
+}
+
+function isTradingDate(date, holidaySet) {
+  if (isIndiaWeekend(date)) return false;
+  return !holidaySet.has(date.getTime());
+}
+
+async function getTradingDates(startDate, endDate) {
+  const dates = [];
+  const current = toIndiaMidnight(startDate);
+  const end = toIndiaMidnight(endDate);
+  const holidaySet = await getHolidaysInRange(startDate, endDate);
+
+  while (current <= end) {
+    if (isTradingDate(current, holidaySet)) {
+      dates.push(new Date(current));
+    }
+    current.setTime(current.getTime() + 24 * 60 * 60 * 1000);
+  }
+
+  return dates;
+}
+
+async function getTradingEndDateForWorkingDays(startDate, workingDays) {
+  if (workingDays <= 0) {
+    throw new Error('workingDays must be greater than zero');
+  }
+
+  const start = toIndiaMidnight(startDate);
+  const maxWindowEnd = addIndiaDays(start, 90);
+  const holidaySet = await getHolidaysInRange(start, maxWindowEnd);
+
+  let current = new Date(start);
+  let counted = 0;
+
+  while (current <= maxWindowEnd) {
+    if (isTradingDate(current, holidaySet)) {
+      counted += 1;
+    }
+
+    if (counted === workingDays) {
+      return new Date(current);
+    }
+
+    current = addIndiaDays(current, 1);
+  }
+
+  throw new Error(`Unable to find ${workingDays} trading days within the search window`);
+}
+
+function calculateTotalProfit(amount, returnPercent) {
+  return roundToTwo(amount * (returnPercent / 100));
+}
+
+function calculateDailyProfit(totalProfit, workingDays) {
+  if (!workingDays) return 0;
+  return roundToTwo(totalProfit / workingDays);
+}
+
+function getIndiaMinutes(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value || 0);
+  const minute = Number(parts.find((part) => part.type === 'minute')?.value || 0);
+  return hour * 60 + minute;
+}
+
+async function isTradingDay(date) {
+  const normalized = toIndiaMidnight(date);
+  const holidaySet = await getHolidaysInRange(normalized, addIndiaDays(normalized, 1));
+  return isTradingDate(normalized, holidaySet);
+}
+
+let earningsProcessorRunning = false;
+
+async function acquireProcessingLock() {
+  if (earningsProcessorRunning) return false;
+  earningsProcessorRunning = true;
+  return true;
+}
+
+async function releaseProcessingLock() {
+  earningsProcessorRunning = false;
+}
+
+async function processDailyInvestmentEarnings() {
+  const lockAcquired = await acquireProcessingLock(5);
+  if (!lockAcquired) {
+    console.log('[earnings] Another earnings processor is already running. Skipping.');
+    return;
+  }
+
+  try {
+    if (getIndiaMinutes() < 15 * 60) {
+      return;
+    }
+
+    const todayIndia = toIndiaMidnight(new Date());
+
+    const activeInvestments = await prisma.transaction.findMany({
+      where: {
+        type: 'investment',
+        investmentStatus: 'Active',
+      },
+    });
+
+    for (const investment of activeInvestments) {
+      try {
+        const startAt = investment.investmentStartAt ? toIndiaMidnight(investment.investmentStartAt) : toIndiaMidnight(investment.createdAt);
+        const endAt = investment.investmentEndAt ? toIndiaMidnight(investment.investmentEndAt) : await getTradingEndDateForWorkingDays(startAt, investment.workingDays || 30);
+        const tradingDates = await getTradingDates(startAt, endAt);
+        const workingDays = tradingDates.length;
+        let investmentDetails = investment.investmentDetails || {};
+        if (typeof investmentDetails === 'string') {
+          try {
+            investmentDetails = JSON.parse(investmentDetails || '{}');
+          } catch {
+            investmentDetails = {};
+          }
+        }
+        const totalProfit = calculateTotalProfit(Number(investment.amount || 0), Number(investment.returnPercent || investmentDetails.returnPercent || 0));
+        if (!workingDays || totalProfit <= 0) {
+          continue;
+        }
+
+        const dailyProfit = calculateDailyProfit(totalProfit, workingDays);
+        const lastTradingDate = tradingDates[tradingDates.length - 1];
+        const eligibleDates = tradingDates.filter((date) => date.getTime() <= todayIndia.getTime());
+        if (!eligibleDates.length) continue;
+
+        const existingEarnings = await prisma.investmentEarning.findMany({
+          where: { investmentId: investment.id },
+        });
+        const existingDates = new Set(existingEarnings.map((earning) => toIndiaMidnight(earning.creditedAt).getTime()));
+        const pendingDates = eligibleDates.filter((date) => !existingDates.has(date.getTime()));
+        if (!pendingDates.length) continue;
+
+        const earningsData = pendingDates.map((date) => {
+          const isFinalProfitDate = date.getTime() === lastTradingDate.getTime();
+          const amount = isFinalProfitDate
+            ? roundToTwo(totalProfit - dailyProfit * (workingDays - 1))
+            : dailyProfit;
+
+          return {
+            id: createId(),
+            investmentId: investment.id,
+            amount,
+            creditedAt: date,
+            status: 'unclaimed',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+        });
+
+        await prisma.$transaction(async (tx) => {
+          await tx.investmentEarning.createMany({
+            data: earningsData,
+            skipDuplicates: true,
+          });
+
+          const aggregate = await tx.investmentEarning.aggregate({
+            where: { investmentId: investment.id },
+            _sum: { amount: true },
+          });
+
+          const totalCredited = roundToTwo(aggregate._sum.amount || 0);
+          const updateData = { creditedEarnings: totalCredited };
+          if (totalCredited >= totalProfit) {
+            updateData.investmentStatus = 'Completed';
+            updateData.completedAt = new Date();
+          }
+
+          await tx.transaction.update({
+            where: { id: investment.id },
+            data: updateData,
+          });
+        });
+      } catch (error) {
+        console.error('[earnings] Failed to process investment', investment.id, error);
+      }
+    }
+  } finally {
+    await releaseProcessingLock();
+  }
+}
+
+module.exports = {
+  createId,
+  roundToTwo,
+  toIndiaMidnight,
+  addIndiaDays,
+  isTradingDay,
+  getTradingDates,
+  getTradingEndDateForWorkingDays,
+  calculateTotalProfit,
+  calculateDailyProfit,
+  getIndiaMinutes,
+  processDailyInvestmentEarnings,
+};
