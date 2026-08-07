@@ -16,6 +16,19 @@
     <main id="app-content" class="app-content"></main>
   </div>
 
+  <script>
+    // If this admin page is opened from a local file, default to the deployed backend URL.
+    // If the page is served from the backend itself, same-origin relative API paths are used.
+    (function() {
+      const params = new URLSearchParams(window.location.search);
+      const apiBaseUrl = params.get('apiBaseUrl') || '';
+      if (apiBaseUrl) {
+        window.__ADMIN_API_BASE_URL = apiBaseUrl.trim();
+      } else if (window.location.protocol === 'file:' && !window.__ADMIN_API_BASE_URL) {
+        window.__ADMIN_API_BASE_URL = 'https://upward-investments-backend-server.onrender.com';
+      }
+    })();
+  </script>
   <script src="admin.js"></script>
 </body>
 </html>

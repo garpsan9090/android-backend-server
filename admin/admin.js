@@ -21,8 +21,8 @@ function apiUrl(path) {
   if (configuredBase) {
     return `${configuredBase.replace(/\/$/, '')}${normalizedPath}`;
   }
-  if (window.location.protocol === 'file:' || (window.location.hostname === 'localhost' && !['4000', '4001'].includes(window.location.port))) {
-    return `http://localhost:4000${normalizedPath}`;
+  if (window.location.protocol === 'file:') {
+    return `https://upward-investments-backend-server.onrender.com${normalizedPath}`;
   }
   return normalizedPath;
 }
@@ -35,11 +35,15 @@ function fetchWithAuth(url, opts = {}) {
 
 async function readResponse(response) {
   const text = await response.text();
-  if (!text) return {};
+  if (!text) return { status: response.status };
   try {
     return JSON.parse(text);
   } catch {
-    return { error: text.replace(/<[^>]*>/g, '').trim() || `Request failed (${response.status})` };
+    return {
+      error: text.replace(/<[^>]*>/g, '').trim() || `Request failed (${response.status})`,
+      status: response.status,
+      rawText: text,
+    };
   }
 }
 
@@ -925,8 +929,8 @@ async function loadUsers(search = '') {
   try {
     const q = search ? `?search=${encodeURIComponent(search)}` : '';
     const res = await fetchWithAuth(`/api/admin/users${q}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to load users');
+    const data = await readResponse(res);
+    if (!res.ok) throw new Error(data.error || data.message || `Failed to load users (${res.status})`);
 
     const users = Array.isArray(data.users) ? data.users : [];
     const filteredUsers = users.filter((user) => {
@@ -1281,8 +1285,8 @@ async function fetchWalletUsers(filter = '', selectedUser = null) {
   try {
     const q = filter ? `?search=${encodeURIComponent(filter)}` : '';
     const res = await fetchWithAuth('/api/admin/users' + q);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed');
+    const data = await readResponse(res);
+    if (!res.ok) throw new Error(data.error || data.message || `Failed (${res.status})`);
 
     const list = document.getElementById('wallet-user-list');
     const users = Array.isArray(data.users) ? data.users : [];
@@ -1370,8 +1374,10 @@ function showWalletForm(user) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, website: 'default', amount: adjustedAmount, reason: `${reason} — ${remarks}` }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Adjustment failed');
+      const data = await readResponse(res);
+      if (!res.ok) {
+        throw new Error(data.error || data.message || `Adjustment failed (${data.status || res.status})`);
+      }
       createToast('Wallet adjustment completed.', 'success');
       renderWallet(user.id, user.username);
     } catch (error) {

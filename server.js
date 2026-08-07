@@ -4,15 +4,14 @@ const dotenv = require('dotenv');
 const envCandidates = [
   path.resolve(__dirname, '.env.local'),
   path.resolve(__dirname, '.env'),
-  path.resolve(__dirname, '..', '.env.local'),
-  path.resolve(__dirname, '..', '.env'),
 ];
 
-for (const envPath of envCandidates) {
-  if (fs.existsSync(envPath)) {
-    dotenv.config({ path: envPath });
-    break;
-  }
+const loadedEnvPath = envCandidates.find((envPath) => fs.existsSync(envPath));
+if (loadedEnvPath) {
+  dotenv.config({ path: loadedEnvPath, override: true });
+  console.log(`Loaded backend env file: ${loadedEnvPath}`);
+} else {
+  console.warn('WARNING: No backend env file found at backend/.env.local or backend/.env.');
 }
 
 const express = require('express');
@@ -27,15 +26,54 @@ const nodemailer = require('nodemailer');
 const {
   processDailyInvestmentEarnings,
   isTradingDay,
+  getIndiaMinutes,
+  addIndiaDays,
 } = require('./services/investmentEarnings');
 const {
   buildPortfolioPlan,
   purchaseInvestment,
   reinvestInvestment,
 } = require('./services/investmentPurchaseService');
-
+const winston = require('winston');
 const app = express();
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
+  transports: [new winston.transports.Console()],
+});
 const port = process.env.PORT || 4000;
+
+// Initialize metrics and optional Sentry
+let promClient = null;
+try {
+  promClient = require('prom-client');
+  const collectDefaultMetrics = promClient.collectDefaultMetrics;
+  collectDefaultMetrics({ timeout: 5000 });
+  app.get('/metrics', async (req, res) => {
+    try {
+      res.set('Content-Type', promClient.register.contentType);
+      res.end(await promClient.register.metrics());
+    } catch (err) {
+      res.status(500).end(err.message);
+    }
+  });
+} catch (e) {
+  logger.warn('[server] prom-client not available', e && e.message ? e.message : e);
+}
+
+// Optional Sentry integration
+try {
+  const Sentry = require('@sentry/node');
+  const SENTRY_DSN = process.env.SENTRY_DSN;
+  if (SENTRY_DSN) {
+    Sentry.init({ dsn: SENTRY_DSN, environment: process.env.NODE_ENV || 'development' });
+    app.use(Sentry.Handlers.requestHandler());
+    app.use(Sentry.Handlers.errorHandler());
+    logger.info('[server] Sentry initialized');
+  }
+} catch (e) {
+  logger.warn('[server] Sentry not available', e && e.message ? e.message : e);
+}
 const rawEmailUser = (process.env.EMAIL_USER || process.env.SMTP_USER || process.env.ADMIN_EMAIL || '').trim();
 const rawEmailPass = (process.env.EMAIL_PASS || process.env.SMTP_PASS || process.env.APP_PASSWORD || '').replace(/\s+/g, '').trim();
 const EMAIL_USER = rawEmailUser;
@@ -46,8 +84,31 @@ if (process.env.EMAIL_PASS && rawEmailPass !== process.env.EMAIL_PASS) {
   console.warn('EMAIL_PASS contained whitespace and was normalized for SMTP auth.');
 }
 
+const SMTP_HOST = (process.env.SMTP_HOST || '').trim();
+const SMTP_PORT = Number(process.env.SMTP_PORT || '587');
+const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
+const emailConfigured = Boolean(EMAIL_USER && EMAIL_PASS && SMTP_HOST);
+let emailTransporter = null;
+if (emailConfigured) {
+  emailTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: EMAIL_USER,
+      pass: EMAIL_PASS,
+    },
+  });
+
+  emailTransporter.verify().then(() => {
+    console.log('✅ Email transporter configured successfully');
+  }).catch((error) => {
+    console.warn('⚠️ Failed to verify email transporter:', error.message || error);
+    emailTransporter = null;
+  });
+}
+
 const OTP_EXPIRY_MINUTES = 5;
-const OTP_RESEND_DELAY_SECONDS = 60;
 const OTP_MAX_VERIFY_ATTEMPTS = 5;
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@upward.com').trim();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
@@ -63,7 +124,17 @@ if (ADMIN_CREATION_KEY) {
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json());
-app.use('/admin', express.static(path.join(__dirname, 'admin')));
+app.use((req, res, next) => {
+  logger.info('request', { method: req.method, url: req.originalUrl, host: req.headers.host, ip: req.ip });
+  next();
+});
+app.use('/admin', express.static(path.join(__dirname, 'admin'), {
+  setHeaders: (res, filePath) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  },
+}));
 app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'admin', 'index.html'));
 });
@@ -193,27 +264,6 @@ function generateOTP() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-async function canSendOTP(email, purpose = 'signup') {
-  const lastOtp = await prisma.oTP.findFirst({
-    where: { email, purpose },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  if (!lastOtp) {
-    return { allowed: true, retryAfterSeconds: 0 };
-  }
-
-  const ageSeconds = Math.floor((Date.now() - new Date(lastOtp.createdAt).getTime()) / 1000);
-  if (ageSeconds < OTP_RESEND_DELAY_SECONDS) {
-    return {
-      allowed: false,
-      retryAfterSeconds: OTP_RESEND_DELAY_SECONDS - ageSeconds,
-    };
-  }
-
-  return { allowed: true, retryAfterSeconds: 0 };
-}
-
 async function createOtpRecord(email, purpose = 'signup') {
   const otp = generateOTP();
   const hashedOtp = await bcrypt.hash(otp, 10);
@@ -236,25 +286,20 @@ async function createOtpRecord(email, purpose = 'signup') {
 
 async function sendEmailOTP(email, purpose = 'signup') {
   const otp = await createOtpRecord(email, purpose);
-  const emailConfigured = Boolean(EMAIL_USER && EMAIL_PASS);
+  console.log(`[otp-debug] generated OTP for ${email}: ${otp}`);
   const subject = purpose === 'password_reset' ? 'Your password reset code' : 'Your signup verification code';
   const actionText = purpose === 'password_reset' ? 'password reset' : 'signup verification';
 
-  if (!emailConfigured) {
-    console.log(`[${purpose}-otp] Email sender is not configured. OTP for ${email}: ${otp}`);
-    throw new Error('Email sender is not configured. Set EMAIL_USER and EMAIL_PASS to send OTP via admin mail.');
+  if (!emailTransporter) {
+    console.warn(`[${purpose}-otp] Email transporter is not configured for ${email}`);
+    throw new Error('OTP email service is not configured');
   }
 
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: EMAIL_USER,
-      pass: EMAIL_PASS,
-    },
-  });
+  const transporter = emailTransporter;
 
   const mailOptions = {
-    from: EMAIL_FROM,
+    from: `"Upward Investments" <${EMAIL_FROM}>`,
+    replyTo: EMAIL_FROM,
     to: email,
     subject,
     html: `
@@ -274,13 +319,58 @@ async function sendEmailOTP(email, purpose = 'signup') {
   };
 
   try {
-    await transporter.sendMail(mailOptions);
-    console.log(`✅ OTP email sent to ${email}`);
-    return otp;
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ OTP email sent to ${email}: accepted=${JSON.stringify(info.accepted)} rejected=${JSON.stringify(info.rejected)} messageId=${info.messageId} response=${info.response}`);
+    if (info.rejected && info.rejected.length > 0) {
+      console.warn(`⚠️ OTP email was rejected for ${email}: ${JSON.stringify(info.rejected)}`);
+    }
+    return { otp };
   } catch (error) {
     console.error('❌ Error sending OTP email:', error);
     await prisma.oTP.deleteMany({ where: { email, purpose } });
     throw new Error('Failed to send OTP email');
+  }
+}
+
+async function dispatchOtpEmail(email, purpose = 'signup', otp) {
+  const subject = purpose === 'password_reset' ? 'Your password reset code' : 'Your signup verification code';
+  const actionText = purpose === 'password_reset' ? 'password reset' : 'signup verification';
+  const transporter = emailTransporter;
+
+  if (!transporter) {
+    console.log(`[${purpose}-otp] Cannot dispatch OTP email, transporter not configured. OTP for ${email}: ${otp}`);
+    return;
+  }
+
+  const mailOptions = {
+    from: `"Upward Investments" <${EMAIL_FROM}>`,
+    replyTo: EMAIL_FROM,
+    to: email,
+    subject,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #7c3aed;">Upward Investments</h2>
+        <p>Hello,</p>
+        <p>Your ${actionText} code is:</p>
+        <div style="background-color: #f3f4f6; padding: 20px; text-align: center; margin: 20px 0;">
+          <span style="font-size: 28px; font-weight: bold; color: #7c3aed; letter-spacing: 4px;">${otp}</span>
+        </div>
+        <p>This code expires in ${OTP_EXPIRY_MINUTES} minutes.</p>
+        <p>If you did not request this code, please ignore this email.</p>
+        <br />
+        <p>Best regards,<br />Upward Investments Team</p>
+      </div>
+    `,
+  };
+
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ OTP email sent to ${email}: accepted=${JSON.stringify(info.accepted)} rejected=${JSON.stringify(info.rejected)} messageId=${info.messageId} response=${info.response}`);
+    if (info.rejected && info.rejected.length > 0) {
+      console.warn(`⚠️ OTP email was rejected for ${email}: ${JSON.stringify(info.rejected)}`);
+    }
+  } catch (error) {
+    console.error(`❌ Async OTP email send failed for ${email}:`, error);
   }
 }
 
@@ -314,6 +404,28 @@ async function verifyOTP(email, otp, purpose = 'signup') {
 }
 
 
+function getIndiaDateKey(date) {
+  return new Date(date).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+async function countUniqueCreditedTradingDays(userId, weekStart, weekEnd) {
+  const earnings = await prisma.investmentEarning.findMany({
+    where: {
+      creditedAt: {
+        gte: weekStart,
+        lt: weekEnd,
+      },
+      transaction: {
+        userId,
+      },
+    },
+    select: { creditedAt: true },
+  });
+
+  const uniqueDays = new Set(earnings.map((record) => getIndiaDateKey(record.creditedAt)));
+  return uniqueDays.size;
+}
+
 async function canClaimWeeklyEarnings(userId) {
   const now = new Date();
   const weekStart = getWeekStart(now);
@@ -336,20 +448,8 @@ async function canClaimWeeklyEarnings(userId) {
     return { canClaim: false, reason: 'already_claimed' };
   }
 
-  const completedEarningsThisWeek = await prisma.investmentEarning.count({
-    where: {
-      status: 'unclaimed',
-      creditedAt: {
-        gte: weekStart,
-        lt: weekEnd,
-      },
-      transaction: {
-        userId,
-      },
-    },
-  });
-
-  if (completedEarningsThisWeek < 5) {
+  const completedTradingDays = await countUniqueCreditedTradingDays(userId, weekStart, weekEnd);
+  if (completedTradingDays < 5) {
     return { canClaim: false, reason: 'wait_for_5_days' };
   }
 
@@ -388,17 +488,7 @@ async function getWeeklyEarningsData(userId) {
   });
 
   const totalUnclaimed = Number(unclaimed.reduce((sum, record) => sum + Number(record.amount), 0).toFixed(2));
-  const completedTradingDays = await prisma.investmentEarning.count({
-    where: {
-      creditedAt: {
-        gte: weekStart,
-        lt: weekEnd,
-      },
-      transaction: {
-        userId,
-      },
-    },
-  });
+  const completedTradingDays = await countUniqueCreditedTradingDays(userId, weekStart, weekEnd);
 
   return {
     totalUnclaimed,
@@ -518,17 +608,22 @@ app.post('/api/admin/add-balance', async (req, res) => {
 
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const updatedUser = await prisma.user.update({ where: { id: user.id }, data: { balance: { increment: Number(amount) } } });
+  const numericAmount = Number(amount);
+  if (numericAmount < 0 && user.balance + numericAmount < 0) {
+    return res.status(400).json({ error: 'Insufficient user balance for deduction' });
+  }
+
+  const updatedUser = await prisma.user.update({ where: { id: user.id }, data: { balance: { increment: numericAmount } } });
 
   const transaction = await prisma.transaction.create({
     data: {
       id: createId(),
-      type: 'deposit',
-      amount: Number(amount),
+      type: numericAmount >= 0 ? 'deposit' : 'withdraw',
+      amount: numericAmount,
       status: 'successful',
-      paymentMethod: 'admin_credit',
-      description: reason || 'Admin credited balance',
-      transactionId: `ADMIN-CREDIT-${Date.now()}`,
+      paymentMethod: numericAmount >= 0 ? 'admin_credit' : 'admin_debit',
+      description: reason || (numericAmount >= 0 ? 'Admin credited balance' : 'Admin deducted balance'),
+      transactionId: `ADMIN-${numericAmount >= 0 ? 'CREDIT' : 'DEBIT'}-${Date.now()}`,
       userId: updatedUser.id,
     },
   });
@@ -1245,24 +1340,13 @@ app.post('/api/register/send-otp', async (req, res) => {
     }
   }
 
-  const rateLimit = await canSendOTP(email, purpose);
-  if (!rateLimit.allowed) {
-    return res.status(429).json({
-      error: `Please wait ${rateLimit.retryAfterSeconds} seconds before requesting a new OTP.`,
-      retryAfterSeconds: rateLimit.retryAfterSeconds,
-    });
-  }
-
   try {
     await sendEmailOTP(email, purpose);
+    return res.json({ message: 'OTP sent to your email address.' });
   } catch (error) {
-    console.error(`[${purpose}-otp] Failed to send email`, error);
+    console.error(`[${purpose}-otp] Failed to send OTP`, error);
     return res.status(500).json({ error: 'Unable to send verification email right now.' });
   }
-
-  res.json({
-    message: 'OTP sent to your email address.',
-  });
 });
 
 app.post('/api/register/verify-otp', async (req, res) => {
@@ -1452,7 +1536,9 @@ app.get('/api/portfolio', async (req, res) => {
     return res.status(401).json({ error: 'Missing auth token' });
   }
 
-  await processDailyInvestmentEarnings();
+  void processDailyInvestmentEarnings().catch((error) => {
+    logger.error('[portfolio] Background earnings processor failed', { error: error?.message || error });
+  });
 
   const user = await prisma.user.findUnique({ where: { id: session.userId } });
   if (!user) {
@@ -1479,6 +1565,25 @@ app.get('/api/portfolio', async (req, res) => {
     return result;
   }, {});
 
+  const todayStart = toIndiaMidnight(new Date());
+  const todayEnd = addIndiaDays(todayStart, 1);
+  const todayEarnings = await prisma.investmentEarning.findMany({
+    where: {
+      creditedAt: {
+        gte: todayStart,
+        lt: todayEnd,
+      },
+      transaction: {
+        userId: user.id,
+      },
+    },
+    select: { investmentId: true, amount: true },
+  });
+  const todayEarningsByInvestment = todayEarnings.reduce((result, earning) => {
+    result[earning.investmentId] = (result[earning.investmentId] || 0) + Number(earning.amount || 0);
+    return result;
+  }, {});
+
   const plans = transactions.map((transaction) => {
     const plan = buildPortfolioPlan(transaction);
     const earningsForPlan = earningsByInvestment[transaction.id] || { unclaimed: 0, claimed: 0 };
@@ -1487,6 +1592,7 @@ app.get('/api/portfolio', async (req, res) => {
       creditedEarnings: Number((earningsForPlan.unclaimed + earningsForPlan.claimed).toFixed(2)),
       portfolioEarnings: Number(earningsForPlan.unclaimed.toFixed(2)),
       claimedEarnings: Number(earningsForPlan.claimed.toFixed(2)),
+      todayGain: Number(todayEarningsByInvestment[transaction.id] || 0),
     };
   });
   const plansByKey = plans.reduce((map, plan) => {
@@ -1499,6 +1605,7 @@ app.get('/api/portfolio', async (req, res) => {
         totalReturn: 0,
         totalProfit: 0,
         dailyProfit: 0,
+        todayGain: 0,
         creditedEarnings: 0,
         portfolioEarnings: 0,
         claimedEarnings: 0,
@@ -1513,6 +1620,7 @@ app.get('/api/portfolio', async (req, res) => {
     map[key].creditedEarnings = (map[key].creditedEarnings || 0) + Number(plan.creditedEarnings || 0);
     map[key].portfolioEarnings = (map[key].portfolioEarnings || 0) + Number(plan.portfolioEarnings || 0);
     map[key].claimedEarnings = (map[key].claimedEarnings || 0) + Number(plan.claimedEarnings || 0);
+    map[key].todayGain = (map[key].todayGain || 0) + Number(plan.todayGain || 0);
 
     if (plan.purchasedAt && (!map[key].purchasedAt || new Date(plan.purchasedAt) < new Date(map[key].purchasedAt))) {
       map[key].purchasedAt = plan.purchasedAt;
@@ -1524,9 +1632,18 @@ app.get('/api/portfolio', async (req, res) => {
     return map;
   }, {});
 
-  const plansWithQuantity = Object.values(plansByKey);
+  const plansWithQuantity = Object.values(plansByKey).map((plan) => {
+    const aggregated = { ...plan };
+    if (aggregated.quantity > 1 && aggregated.amountLabel) {
+      aggregated.unitAmountLabel = aggregated.amountLabel;
+      const formattedTotalAmount = `₹${Number(aggregated.amount).toLocaleString('en-IN', { maximumFractionDigits: 2, minimumFractionDigits: Number.isInteger(aggregated.amount) ? 0 : 2 })}`;
+      aggregated.amountLabel = `${formattedTotalAmount} (${aggregated.quantity}× ${aggregated.unitAmountLabel})`;
+    }
+    return aggregated;
+  });
   const weeklyData = await getWeeklyEarningsData(user.id);
-  const isTradingDayToday = await isTradingDay(new Date());
+  const now = new Date();
+  const isTradingDayToday = getIndiaMinutes(now) >= 16 * 60 ? await isTradingDay(now) : false;
 
   res.json({ balance: user.balance, plans: plansWithQuantity, totalInvested: plansWithQuantity.reduce((sum, plan) => sum + plan.amount, 0), weeklyData, isTradingDay: isTradingDayToday });
 });
@@ -1618,7 +1735,7 @@ app.post('/api/portfolio/purchase', async (req, res) => {
     return res.status(400).json({ error: 'Plan amount is required' });
   }
 
-  if (![30, 37].includes(returnPct)) {
+  if (!Number.isFinite(returnPct) || returnPct <= 0) {
     return res.status(400).json({ error: 'Invalid plan return percentage' });
   }
 
@@ -1641,7 +1758,7 @@ app.post('/api/portfolio/purchase', async (req, res) => {
       amountLabel,
       returnLabel,
       returnPercent: returnPct,
-      durationLabel: durationLabel || '30 Working Days',
+      durationLabel: durationLabel || '1 Month',
       premium,
     });
 

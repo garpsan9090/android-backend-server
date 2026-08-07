@@ -1,5 +1,35 @@
 const crypto = require('crypto');
 const { prisma } = require('../prisma');
+let redisClient = null;
+try {
+  const IORedis = require('ioredis');
+  const REDIS_URL = process.env.REDIS_URL || process.env.REDIS || null;
+  if (REDIS_URL) redisClient = new IORedis(REDIS_URL);
+} catch (e) {
+  // redis optional
+}
+
+const cacheMap = new Map();
+
+async function cacheGet(key) {
+  if (redisClient) {
+    const raw = await redisClient.get(key);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return raw; }
+  }
+  const entry = cacheMap.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) { cacheMap.delete(key); return null; }
+  return entry.value;
+}
+
+async function cacheSet(key, value, ttlSec = 60) {
+  if (redisClient) {
+    try { await redisClient.set(key, JSON.stringify(value), 'EX', Math.max(1, ttlSec)); } catch {}
+    return;
+  }
+  cacheMap.set(key, { value, expiry: Date.now() + ttlSec * 1000 });
+}
 
 function createId() {
   return crypto.randomBytes(16).toString('hex');
@@ -29,6 +59,12 @@ function isIndiaWeekend(date) {
 async function getHolidaysInRange(startDate, endDate) {
   const start = toIndiaMidnight(startDate);
   const end = toIndiaMidnight(endDate);
+  const cacheKey = `holidays:${start.getTime()}:${end.getTime()}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) {
+    return new Set(cached);
+  }
+
   const holidays = await prisma.holiday.findMany({
     where: {
       date: {
@@ -37,7 +73,9 @@ async function getHolidaysInRange(startDate, endDate) {
       },
     },
   });
-  return new Set(holidays.map((holiday) => toIndiaMidnight(holiday.date).getTime()));
+  const result = new Set(holidays.map((holiday) => toIndiaMidnight(holiday.date).getTime()));
+  await cacheSet(cacheKey, Array.from(result), 60 * 60); // cache for 1 hour
+  return result;
 }
 
 function isTradingDate(date, holidaySet) {
@@ -151,7 +189,7 @@ async function processDailyInvestmentEarnings() {
     for (const investment of activeInvestments) {
       try {
         const startAt = investment.investmentStartAt ? toIndiaMidnight(investment.investmentStartAt) : toIndiaMidnight(investment.createdAt);
-        const endAt = investment.investmentEndAt ? toIndiaMidnight(investment.investmentEndAt) : await getTradingEndDateForWorkingDays(startAt, investment.workingDays || 30);
+        const endAt = investment.investmentEndAt ? toIndiaMidnight(investment.investmentEndAt) : await getTradingEndDateForWorkingDays(startAt, investment.workingDays || 22);
         const tradingDates = await getTradingDates(startAt, endAt);
         const workingDays = tradingDates.length;
         let investmentDetails = investment.investmentDetails || {};
@@ -241,3 +279,56 @@ module.exports = {
   getIndiaMinutes,
   processDailyInvestmentEarnings,
 };
+
+async function finalizeInvestment(investmentId) {
+  const investment = await prisma.transaction.findUnique({ where: { id: investmentId } });
+  if (!investment) throw new Error('Investment not found');
+
+  const startAt = investment.investmentStartAt ? toIndiaMidnight(investment.investmentStartAt) : toIndiaMidnight(investment.createdAt);
+  const workingDays = investment.investmentDurationDays || investment.workingDays || (investment.investmentDetails && investment.investmentDetails.workingDays) || 22;
+  const endAt = await getTradingEndDateForWorkingDays(startAt, workingDays);
+  const tradingDates = await getTradingDates(startAt, endAt);
+
+  const detailsRaw = investment.investmentDetails || {};
+  let details = detailsRaw;
+  if (typeof detailsRaw === 'string') {
+    try { details = JSON.parse(detailsRaw || '{}'); } catch { details = {}; }
+  }
+
+  const totalProfit = calculateTotalProfit(Number(investment.amount || 0), Number(investment.returnPercent || details.returnPercent || 0));
+  const dailyProfit = calculateDailyProfit(totalProfit, tradingDates.length || workingDays);
+
+  const earningsData = tradingDates.map((date, idx) => {
+    const isFinal = idx === tradingDates.length - 1;
+    const amount = isFinal ? roundToTwo(totalProfit - dailyProfit * (tradingDates.length - 1)) : dailyProfit;
+    return {
+      id: crypto.randomBytes(16).toString('hex'),
+      investmentId: investment.id,
+      amount,
+      creditedAt: date,
+      status: 'unclaimed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  });
+
+  await prisma.$transaction(async (tx) => {
+    if (earningsData.length) {
+      await tx.investmentEarning.createMany({ data: earningsData, skipDuplicates: true });
+    }
+
+    const aggregate = await tx.investmentEarning.aggregate({ where: { investmentId: investment.id }, _sum: { amount: true } });
+    const totalCredited = roundToTwo(aggregate._sum.amount || 0);
+
+    const updateData = { creditedEarnings: totalCredited, investmentEndAt: endAt, workingDays: tradingDates.length };
+    if (totalCredited >= totalProfit) {
+      updateData.investmentStatus = 'Completed';
+      updateData.completedAt = new Date();
+    }
+
+    await tx.transaction.update({ where: { id: investment.id }, data: updateData });
+  });
+}
+
+module.exports.finalizeInvestment = finalizeInvestment;
+

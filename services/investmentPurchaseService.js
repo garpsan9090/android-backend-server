@@ -10,6 +10,28 @@ const {
   getIndiaMinutes,
 } = require('./investmentEarnings');
 
+function determineWorkingDays(durationLabel, planType) {
+  const normalizedLabel = String(durationLabel || '').trim().toLowerCase();
+  if (normalizedLabel.includes('month')) {
+    return 22;
+  }
+  const daysMatch = normalizedLabel.match(/(\d+)\s*days?/i);
+  if (daysMatch) {
+    return Number(daysMatch[1]);
+  }
+  const weeksMatch = normalizedLabel.match(/(\d+)\s*weeks?/i);
+  if (weeksMatch) {
+    return Number(weeksMatch[1]) * 5;
+  }
+  if (planType === 'fno') {
+    return 5;
+  }
+  if (planType === 'equity') {
+    return 22;
+  }
+  return 22;
+}
+
 function buildPortfolioPlan(transaction) {
   let details = {};
   try {
@@ -28,7 +50,7 @@ function buildPortfolioPlan(transaction) {
   const expectedReturn = Number(transaction.expectedReturn || 0);
   const returnPercent = Number(transaction.returnPercent || details.returnPercent || (amount && expectedReturn ? ((expectedReturn - amount) / amount) * 100 : 0));
   const totalProfit = Number(transaction.totalProfit ?? details.totalProfit ?? Math.max(expectedReturn - amount, 0));
-  const workingDays = Number(transaction.workingDays || details.workingDays || 30);
+  const workingDays = Number(transaction.workingDays || details.workingDays || 22);
   const dailyProfit = Number(transaction.dailyProfit ?? details.dailyProfit ?? (workingDays ? totalProfit / workingDays : 0));
 
   const investmentStatus = transaction.investmentStatus || 'Active';
@@ -46,7 +68,7 @@ function buildPortfolioPlan(transaction) {
     amountLabel: details.amountLabel || `₹${Number(transaction.amount || 0).toLocaleString('en-IN')}`,
     returnLabel: details.returnLabel || 'Up to 0%',
     returnPercent,
-    durationLabel: transaction.investmentDuration || details.durationLabel || '30 Working Days',
+    durationLabel: transaction.investmentDuration || details.durationLabel || '22 Working Days',
     totalReturn: expectedReturn || amount + totalProfit,
     totalProfit,
     dailyProfit,
@@ -73,6 +95,8 @@ async function purchaseInvestment({
   durationLabel,
   premium,
 }) {
+  const { enqueueFinalize } = require('../queues/finalizeQueue');
+
   const investmentAmount = Number(amount || 0);
   const returnPct = Number(returnPercent || 0);
   const purchaseTime = new Date();
@@ -80,12 +104,12 @@ async function purchaseInvestment({
   const investmentStartAt = getIndiaMinutes(purchaseTime) >= 15 * 60
     ? new Date(purchaseDay.getTime() + 24 * 60 * 60 * 1000)
     : purchaseDay;
-  const workingDays = 30;
-  const investmentEndAt = await getTradingEndDateForWorkingDays(investmentStartAt, workingDays);
-  const tradingDates = await getTradingDates(investmentStartAt, investmentEndAt);
+  const workingDays = determineWorkingDays(durationLabel, planType);
   const totalProfit = calculateTotalProfit(investmentAmount, returnPct);
   const dailyProfit = calculateDailyProfit(totalProfit, workingDays);
   const expectedReturn = roundToTwo(investmentAmount + totalProfit);
+
+  const estimatedEnd = await getTradingEndDateForWorkingDays(investmentStartAt, workingDays);
 
   const transaction = await prisma.$transaction(async (tx) => {
     await tx.user.update({
@@ -104,14 +128,14 @@ async function purchaseInvestment({
         userId,
         investmentPlanId: planId,
         investmentName: planName,
-        investmentDuration: durationLabel || '30 Working Days',
+        investmentDuration: durationLabel || `${workingDays} Working Days`,
         investmentDurationDays: workingDays,
         returnPercent: returnPct,
         expectedReturn,
         totalProfit,
         dailyProfit,
         investmentStartAt,
-        investmentEndAt,
+        investmentEndAt: estimatedEnd,
         workingDays,
         creditedEarnings: 0,
         investmentStatus: 'Active',
@@ -121,20 +145,26 @@ async function purchaseInvestment({
           returnLabel,
           returnPercent: returnPct,
           premium,
-          durationLabel: durationLabel || '30 Working Days',
-          expiresAt: investmentEndAt.toISOString(),
+          durationLabel: durationLabel || `${workingDays} Working Days`,
+          expiresAt: estimatedEnd.toISOString(),
           workingDays,
           totalProfit,
           dailyProfit,
-          tradingDays: tradingDates.map((date) => date.toISOString()),
+          tradingDays: [],
         }),
       },
     });
   });
 
+  // enqueue background finalize work (best-effort)
+  try {
+    void enqueueFinalize(transaction.id);
+  } catch (e) {
+    console.error('[purchase] failed to enqueue finalize job', e && e.message ? e.message : e);
+  }
+
   return transaction;
 }
-
 async function reinvestInvestment({ userId, investmentId }) {
   const investment = await prisma.transaction.findUnique({ where: { id: investmentId } });
   if (!investment || investment.userId !== userId) {
@@ -152,13 +182,13 @@ async function reinvestInvestment({ userId, investmentId }) {
   const returnPct = Number(investment.returnPercent || details.returnPercent || 0);
   const planName = investment.investmentName || details.planName || 'Investment Plan';
   const planType = details.planType || 'equity';
-  const planDurationLabel = investment.investmentDuration || details.durationLabel || '30 Working Days';
+  const planDurationLabel = investment.investmentDuration || details.durationLabel || '22 Working Days';
   const purchaseTime = new Date();
   const purchaseDay = toIndiaMidnight(purchaseTime);
   const investmentStartAt = getIndiaMinutes(purchaseTime) >= 15 * 60
     ? new Date(purchaseDay.getTime() + 24 * 60 * 60 * 1000)
     : purchaseDay;
-  const workingDays = investment.investmentDurationDays || details.workingDays || 30;
+  const workingDays = investment.investmentDurationDays || details.workingDays || 22;
   const investmentEndAt = await getTradingEndDateForWorkingDays(investmentStartAt, workingDays);
   const tradingDates = await getTradingDates(investmentStartAt, investmentEndAt);
   const totalProfit = calculateTotalProfit(reinvestAmount, returnPct);
@@ -204,6 +234,14 @@ async function reinvestInvestment({ userId, investmentId }) {
       reinvestedFromId: investment.id,
     },
   });
+
+  // enqueue finalize for reinvested plan
+  try {
+    const { enqueueFinalize } = require('../queues/finalizeQueue');
+    void enqueueFinalize(newInvestment.id);
+  } catch (e) {
+    console.error('[reinvest] failed to enqueue finalize job', e && e.message ? e.message : e);
+  }
 
   await prisma.transaction.update({
     where: { id: investment.id },
