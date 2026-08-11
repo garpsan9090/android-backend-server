@@ -74,6 +74,57 @@ function getIndiaWeekEnd(date = new Date()) {
   return toIndiaMidnight(end);
 }
 
+function parseDurationDays(label) {
+  if (!label) return 22;
+  const normalized = label.toLowerCase();
+  if (normalized.includes('month')) return 22;
+  const match = label.match(/(\d+)\s*days?/i);
+  return match ? Number(match[1]) : 22;
+}
+
+function buildPortfolioPlan(transaction, todayGain = 0) {
+  let details = {};
+  try {
+    if (transaction.investmentDetails) {
+      details = typeof transaction.investmentDetails === 'string'
+        ? JSON.parse(transaction.investmentDetails)
+        : transaction.investmentDetails;
+    }
+  } catch {
+    details = {};
+  }
+
+  const purchasedAt = transaction.investmentStartAt ? new Date(transaction.investmentStartAt) : new Date(transaction.createdAt);
+  const durationDays = Math.max(parseDurationDays(transaction.investmentDuration || details.durationLabel || '30 Days'), 1);
+  const expiresAt = new Date(purchasedAt.getTime() + durationDays * 24 * 60 * 60 * 1000);
+  const totalProfit = Number(transaction.totalProfit ?? details.totalProfit ?? Math.max(Number(transaction.expectedReturn || 0) - Number(transaction.amount || 0), 0));
+  const workingDays = Number(transaction.workingDays || details.workingDays || 22);
+  const dailyProfit = Number(transaction.dailyProfit ?? details.dailyProfit ?? (workingDays ? totalProfit / workingDays : 0));
+
+  return {
+    id: transaction.investmentPlanId || transaction.id,
+    planName: transaction.investmentName || details.planName || 'Investment Plan',
+    planType: details.planType || 'equity',
+    amount: Number(transaction.amount || 0),
+    amountLabel: details.amountLabel || `₹${Number(transaction.amount || 0).toLocaleString('en-IN')}`,
+    returnLabel: details.returnLabel || 'Up to 0%',
+    returnPercent: Number(details.returnPercent || 0),
+    durationLabel: transaction.investmentDuration || details.durationLabel || '30 Days',
+    totalReturn: Number(transaction.expectedReturn || 0),
+    totalProfit,
+    dailyProfit,
+    premium: Boolean(details.premium),
+    purchasedAt: purchasedAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    workingDays,
+    creditedEarnings: Number(transaction.creditedEarnings || 0),
+    todayGain: Number(todayGain || 0),
+    portfolioEarnings: Number(transaction.creditedEarnings || 0),
+    investmentStatus: transaction.investmentStatus,
+    transactionId: transaction.transactionId,
+  };
+}
+
 function buildWeeklyEarningsSummary(earnings, referenceDate = new Date()) {
   const weekStart = getIndiaWeekStart(referenceDate);
   const weekEnd = getIndiaWeekEnd(referenceDate);
@@ -334,6 +385,8 @@ async function getPortfolioSummaryForUser({ userId, referenceDate = new Date() }
 
   const investmentIds = transactions.map((transaction) => transaction.id);
   let todayGainMap = new Map();
+  let creditedEarningsMap = new Map();
+
   if (investmentIds.length) {
     const todayStart = toIndiaMidnight(referenceDate);
     const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
@@ -351,12 +404,23 @@ async function getPortfolioSummaryForUser({ userId, referenceDate = new Date() }
     });
 
     todayGainMap = new Map(todayEarnings.map((item) => [item.investmentId, Number(item._sum.amount || 0)]));
+
+    const creditedEarnings = await prisma.investmentEarning.groupBy({
+      by: ['investmentId'],
+      _sum: { amount: true },
+      where: {
+        investmentId: { in: investmentIds },
+      },
+    });
+
+    creditedEarningsMap = new Map(creditedEarnings.map((item) => [item.investmentId, Number(item._sum.amount || 0)]));
   }
 
   const plans = transactions.map((transaction) => {
     const todayGain = todayGainMap.get(transaction.id) || 0;
+    const creditedEarnings = Number(creditedEarningsMap.get(transaction.id) ?? transaction.creditedEarnings ?? 0);
     return {
-      ...buildPortfolioPlan(transaction, todayGain),
+      ...buildPortfolioPlan({ ...transaction, creditedEarnings }, todayGain),
     };
   });
 
