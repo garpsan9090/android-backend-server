@@ -8,6 +8,7 @@ const { prisma } = require('./prisma');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const IORedis = require('ioredis');
+const { getPortfolioSummaryForUser, claimPendingWeekEarnings } = require('./services/investmentEarnings');
 
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS || null;
 const hasRedis = Boolean(REDIS_URL);
@@ -536,41 +537,30 @@ app.get('/api/portfolio', async (req, res) => {
     return res.json(cached);
   }
 
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
+  try {
+    const response = await getPortfolioSummaryForUser({ userId: session.userId, referenceDate: new Date() });
+    await cacheSet(cacheKey, response);
+    return res.json(response);
+  } catch (error) {
+    const message = error?.message || 'Unable to load portfolio.';
+    return res.status(404).json({ error: message });
+  }
+});
+
+app.post('/api/investment/claim-weekly-earnings', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) {
+    return res.status(401).json({ error: 'Missing auth token' });
   }
 
-  const transactions = await prisma.transaction.findMany({
-    where: { userId: user.id, type: 'investment' },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  const investmentIds = transactions.map((transaction) => transaction.id);
-  let todayGainMap = new Map();
-  if (investmentIds.length) {
-    const todayStart = toIndiaMidnight(new Date());
-    const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
-
-    const todayEarnings = await prisma.investmentEarning.groupBy({
-      by: ['investmentId'],
-      _sum: { amount: true },
-      where: {
-        investmentId: { in: investmentIds },
-        creditedAt: {
-          gte: todayStart,
-          lt: tomorrowStart,
-        },
-      },
-    });
-
-    todayGainMap = new Map(todayEarnings.map((item) => [item.investmentId, Number(item._sum.amount || 0)]));
+  try {
+    const result = await claimPendingWeekEarnings({ userId: session.userId, referenceDate: new Date() });
+    return res.json(result);
+  } catch (error) {
+    const message = error?.message || 'Unable to claim weekly earnings.';
+    const status = error?.statusCode || 500;
+    return res.status(status).json({ error: message });
   }
-
-  const plans = transactions.map((transaction) => buildPortfolioPlan(transaction, todayGainMap.get(transaction.id) || 0));
-  const response = { balance: user.balance, plans, totalInvested: plans.reduce((sum, plan) => sum + plan.amount, 0) };
-  await cacheSet(cacheKey, response);
-  res.json(response);
 });
 
 app.post('/api/portfolio/purchase', async (req, res) => {

@@ -56,6 +56,61 @@ function isIndiaWeekend(date) {
   return weekday === 'Sat' || weekday === 'Sun';
 }
 
+function getIndiaWeekStart(date = new Date()) {
+  const indiaMidnight = toIndiaMidnight(date);
+  const weekday = new Date(indiaMidnight).toLocaleString('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' });
+  const map = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 0 };
+  const idx = map[weekday] ?? 1;
+  const start = new Date(indiaMidnight);
+  const diff = idx === 0 ? -6 : 1 - idx;
+  start.setDate(start.getDate() + diff);
+  return toIndiaMidnight(start);
+}
+
+function getIndiaWeekEnd(date = new Date()) {
+  const start = getIndiaWeekStart(date);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  return toIndiaMidnight(end);
+}
+
+function buildWeeklyEarningsSummary(earnings, referenceDate = new Date()) {
+  const weekStart = getIndiaWeekStart(referenceDate);
+  const weekEnd = getIndiaWeekEnd(referenceDate);
+
+  const allEarnings = Array.isArray(earnings) ? earnings : [];
+  const unclaimed = allEarnings.filter((earning) => String(earning.status || '').toLowerCase() !== 'claimed');
+  const totalUnclaimed = roundToTwo(unclaimed.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+
+  const lastClaimedAt = allEarnings
+    .filter((earning) => String(earning.status || '').toLowerCase() === 'claimed' && earning.claimedAt)
+    .reduce((latest, earning) => {
+      const timestamp = new Date(earning.claimedAt).getTime();
+      return latest === null || timestamp > latest ? timestamp : latest;
+    }, null);
+
+  const pendingAfterLastClaim = unclaimed.filter((earning) => {
+    if (lastClaimedAt === null) return true;
+    return new Date(earning.creditedAt).getTime() > lastClaimedAt;
+  });
+
+  const completedTradingDays = new Set(
+    pendingAfterLastClaim.map((earning) => toIndiaMidnight(earning.creditedAt).getTime())
+  ).size;
+
+  const claimAllowed = completedTradingDays >= 5 && totalUnclaimed > 0;
+  const alreadyClaimed = totalUnclaimed === 0;
+
+  return {
+    weekStart: weekStart.toISOString(),
+    weekEnd: weekEnd.toISOString(),
+    totalUnclaimed,
+    completedTradingDays,
+    claimAllowed,
+    alreadyClaimed,
+  };
+}
+
 async function getHolidaysInRange(startDate, endDate) {
   const start = toIndiaMidnight(startDate);
   const end = toIndiaMidnight(endDate);
@@ -266,6 +321,128 @@ async function processDailyInvestmentEarnings() {
   }
 }
 
+async function getPortfolioSummaryForUser({ userId, referenceDate = new Date() }) {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const transactions = await prisma.transaction.findMany({
+    where: { userId, type: 'investment' },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  const investmentIds = transactions.map((transaction) => transaction.id);
+  let todayGainMap = new Map();
+  if (investmentIds.length) {
+    const todayStart = toIndiaMidnight(referenceDate);
+    const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+
+    const todayEarnings = await prisma.investmentEarning.groupBy({
+      by: ['investmentId'],
+      _sum: { amount: true },
+      where: {
+        investmentId: { in: investmentIds },
+        creditedAt: {
+          gte: todayStart,
+          lt: tomorrowStart,
+        },
+      },
+    });
+
+    todayGainMap = new Map(todayEarnings.map((item) => [item.investmentId, Number(item._sum.amount || 0)]));
+  }
+
+  const plans = transactions.map((transaction) => {
+    const todayGain = todayGainMap.get(transaction.id) || 0;
+    return {
+      ...buildPortfolioPlan(transaction, todayGain),
+    };
+  });
+
+  const allEarnings = await prisma.investmentEarning.findMany({
+    where: { transaction: { userId } },
+    orderBy: { creditedAt: 'asc' },
+  });
+
+  return {
+    balance: user.balance,
+    plans,
+    totalInvested: plans.reduce((sum, plan) => sum + plan.amount, 0),
+    weeklyData: buildWeeklyEarningsSummary(allEarnings, referenceDate),
+  };
+}
+
+async function claimPendingWeekEarnings({ userId, referenceDate = new Date() }) {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const allUnclaimedEarnings = await prisma.investmentEarning.findMany({
+    where: {
+      transaction: { userId },
+      status: 'unclaimed',
+    },
+    orderBy: { creditedAt: 'asc' },
+  });
+
+  if (!allUnclaimedEarnings.length) {
+    const summary = buildWeeklyEarningsSummary([], referenceDate);
+    return {
+      claimedAmount: 0,
+      balance: user.balance,
+      weeklyData: summary,
+    };
+  }
+
+  const lastClaimed = await prisma.investmentEarning.findFirst({
+    where: { transaction: { userId }, status: 'claimed' },
+    orderBy: { claimedAt: 'desc' },
+  });
+
+  const claimableEarnings = allUnclaimedEarnings.filter((earning) => {
+    if (!lastClaimed || !lastClaimed.claimedAt) return true;
+    return new Date(earning.creditedAt).getTime() > new Date(lastClaimed.claimedAt).getTime();
+  });
+
+  const completedTradingDays = new Set(
+    claimableEarnings.map((earning) => new Date(earning.creditedAt).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })),
+  ).size;
+
+  if (completedTradingDays < 5) {
+    const err = new Error('You can claim only after 5 complete trading days since your last claim.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const totalClaimable = claimableEarnings.reduce((sum, earning) => sum + Number(earning.amount || 0), 0);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.investmentEarning.updateMany({
+      where: { id: { in: claimableEarnings.map((earning) => earning.id) } },
+      data: { status: 'claimed', claimedAt: new Date() },
+    });
+
+    await tx.user.update({
+      where: { id: userId },
+      data: { balance: { increment: totalClaimable } },
+    });
+  });
+
+  const updatedUser = await prisma.user.findUnique({ where: { id: userId } });
+  const allEarnings = await prisma.investmentEarning.findMany({
+    where: { transaction: { userId } },
+    orderBy: { creditedAt: 'asc' },
+  });
+
+  return {
+    claimedAmount: totalClaimable,
+    balance: updatedUser?.balance ?? user.balance,
+    weeklyData: buildWeeklyEarningsSummary(allEarnings, referenceDate),
+  };
+}
+
 module.exports = {
   createId,
   roundToTwo,
@@ -278,6 +455,9 @@ module.exports = {
   calculateDailyProfit,
   getIndiaMinutes,
   processDailyInvestmentEarnings,
+  buildWeeklyEarningsSummary,
+  getPortfolioSummaryForUser,
+  claimPendingWeekEarnings,
 };
 
 async function finalizeInvestment(investmentId) {
