@@ -48,5 +48,7 @@ Steps:
    - `ADMIN_PASSWORD`
    - `ADMIN_CREATION_KEY` (optional)
    - `REDIS_URL` (optional)
+   - `UPSTASH_REDIS_REST_URL` (optional)
+   - `UPSTASH_REDIS_REST_TOKEN` (optional)
 
 If you want Render to run the backend from the `backend` folder, the `render.yaml` file already points to that folder.

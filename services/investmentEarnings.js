@@ -1,10 +1,48 @@
 const crypto = require('crypto');
+const axios = require('axios');
 const { prisma } = require('../prisma');
+
+const REDIS_URL = process.env.REDIS_URL || process.env.REDIS || null;
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL || null;
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || null;
+
 let redisClient = null;
+
+function createUpstashRedisClient(baseUrl, token) {
+  const client = axios.create({
+    baseURL: baseUrl,
+    timeout: 10000,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  async function execute(command) {
+    const response = await client.post('', command);
+    if (response.data?.error) {
+      throw new Error(response.data.error);
+    }
+    return response.data?.result;
+  }
+
+  return {
+    get: async (key) => execute(['get', key]),
+    set: async (key, value, mode, ttl) => {
+      const command = mode === 'EX' ? ['set', key, value, 'EX', String(ttl)] : ['set', key, value];
+      return execute(command);
+    },
+    del: async (...keys) => execute(['del', ...keys]),
+  };
+}
+
 try {
-  const IORedis = require('ioredis');
-  const REDIS_URL = process.env.REDIS_URL || process.env.REDIS || null;
-  if (REDIS_URL) redisClient = new IORedis(REDIS_URL);
+  if (REDIS_URL) {
+    const IORedis = require('ioredis');
+    redisClient = new IORedis(REDIS_URL);
+  } else if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
+    redisClient = createUpstashRedisClient(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN);
+  }
 } catch (e) {
   // redis optional
 }
@@ -15,7 +53,13 @@ async function cacheGet(key) {
   if (redisClient) {
     const raw = await redisClient.get(key);
     if (!raw) return null;
-    try { return JSON.parse(raw); } catch { return raw; }
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'payload')) {
+        return parsed.payload;
+      }
+      return parsed;
+    } catch { return raw; }
   }
   const entry = cacheMap.get(key);
   if (!entry) return null;
@@ -25,10 +69,41 @@ async function cacheGet(key) {
 
 async function cacheSet(key, value, ttlSec = 60) {
   if (redisClient) {
-    try { await redisClient.set(key, JSON.stringify(value), 'EX', Math.max(1, ttlSec)); } catch {}
+    try {
+      const wrapper = { payload: value, lastUpdated: Date.now() };
+      await redisClient.set(key, JSON.stringify(wrapper), 'EX', Math.max(1, ttlSec));
+    } catch {}
     return;
   }
   cacheMap.set(key, { value, expiry: Date.now() + ttlSec * 1000 });
+}
+
+async function cacheGetRaw(key) {
+  if (redisClient) {
+    try {
+      const raw = await redisClient.get(key);
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch { return null; }
+    } catch { return null; }
+  }
+  const entry = cacheMap.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) { cacheMap.delete(key); return null; }
+  return { payload: entry.value, lastUpdated: entry.expiry - entry.value }; // best-effort
+}
+
+async function cacheSetIfNewer(key, value, ttlSec = 60, lastUpdated = Date.now()) {
+  if (!redisClient) return cacheSet(key, value, ttlSec);
+  try {
+    const existing = await cacheGetRaw(key);
+    if (existing && existing.lastUpdated && existing.lastUpdated > lastUpdated) {
+      return;
+    }
+    const wrapper = { payload: value, lastUpdated };
+    await redisClient.set(key, JSON.stringify(wrapper), 'EX', Math.max(1, ttlSec));
+  } catch (e) {
+    // ignore
+  }
 }
 
 function createId() {
@@ -114,6 +189,7 @@ function buildPortfolioPlan(transaction, todayGain = 0) {
     totalProfit,
     dailyProfit,
     premium: Boolean(details.premium),
+    quantity: 1,
     purchasedAt: purchasedAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
     workingDays,
@@ -180,7 +256,7 @@ async function getHolidaysInRange(startDate, endDate) {
     },
   });
   const result = new Set(holidays.map((holiday) => toIndiaMidnight(holiday.date).getTime()));
-  await cacheSet(cacheKey, Array.from(result), 60 * 60); // cache for 1 hour
+  await cacheSetIfNewer(cacheKey, Array.from(result), 60 * 60, Date.now()).catch(() => {}); // cache for 1 hour
   return result;
 }
 
@@ -424,6 +500,30 @@ async function getPortfolioSummaryForUser({ userId, referenceDate = new Date() }
     };
   });
 
+  // Aggregate plans by plan id + amount into quantities
+  const grouped = {};
+  for (const p of plans) {
+    const key = `${p.id}::${p.amount}`;
+    if (!grouped[key]) {
+      grouped[key] = { ...p, quantity: Number(p.quantity || 1) };
+    } else {
+      grouped[key].quantity += Number(p.quantity || 1);
+      grouped[key].totalProfit = Number(grouped[key].totalProfit || 0) + Number(p.totalProfit || 0);
+      grouped[key].creditedEarnings = Number(grouped[key].creditedEarnings || 0) + Number(p.creditedEarnings || 0);
+      grouped[key].portfolioEarnings = Number(grouped[key].portfolioEarnings || 0) + Number(p.portfolioEarnings || 0);
+      grouped[key].todayGain = Number(grouped[key].todayGain || 0) + Number(p.todayGain || 0);
+      // keep earliest purchasedAt and latest expiresAt
+      if (new Date(p.purchasedAt).getTime() < new Date(grouped[key].purchasedAt).getTime()) {
+        grouped[key].purchasedAt = p.purchasedAt;
+      }
+      if (new Date(p.expiresAt).getTime() > new Date(grouped[key].expiresAt).getTime()) {
+        grouped[key].expiresAt = p.expiresAt;
+      }
+    }
+  }
+
+  const aggregatedPlans = Object.values(grouped);
+
   const allEarnings = await prisma.investmentEarning.findMany({
     where: { transaction: { userId } },
     orderBy: { creditedAt: 'asc' },
@@ -431,8 +531,8 @@ async function getPortfolioSummaryForUser({ userId, referenceDate = new Date() }
 
   return {
     balance: user.balance,
-    plans,
-    totalInvested: plans.reduce((sum, plan) => sum + plan.amount, 0),
+    plans: aggregatedPlans,
+    totalInvested: aggregatedPlans.reduce((sum, plan) => sum + plan.amount * (plan.quantity || 1), 0),
     weeklyData: buildWeeklyEarningsSummary(allEarnings, referenceDate),
   };
 }

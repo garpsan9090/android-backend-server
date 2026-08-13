@@ -73,6 +73,7 @@ function buildPortfolioPlan(transaction) {
     totalProfit,
     dailyProfit,
     premium: Boolean(details.premium),
+    quantity: 1,
     purchasedAt: purchasedAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
     workingDays,
@@ -110,8 +111,54 @@ async function purchaseInvestment({
   const expectedReturn = roundToTwo(investmentAmount + totalProfit);
 
   const estimatedEnd = await getTradingEndDateForWorkingDays(investmentStartAt, workingDays);
+  // Enforce F&O single-active / 30-day cooldown inside the DB transaction to avoid races
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  const isFno = (planType === 'fno' || planType === 'futures' || planType === 'options');
 
   const transaction = await prisma.$transaction(async (tx) => {
+    if (isFno) {
+      const activeSamePlan = await tx.transaction.findFirst({
+        where: {
+          userId,
+          type: 'investment',
+          investmentPlanId: String(planId || ''),
+          investmentStatus: { in: ['Active', 'Reinvested'] },
+        },
+      });
+      if (activeSamePlan) {
+        const err = new Error('You already have this F&O plan active. Wait until it completes before purchasing again.');
+        err.code = 'FNO_ACTIVE';
+        throw err;
+      }
+
+      const thirtyDaysAgo = new Date(Date.now() - THIRTY_DAYS_MS);
+      const recentCompletedSamePlan = await tx.transaction.findFirst({
+        where: {
+          userId,
+          type: 'investment',
+          investmentPlanId: String(planId || ''),
+          investmentStatus: 'Completed',
+          completedAt: { gte: thirtyDaysAgo },
+        },
+        orderBy: { completedAt: 'desc' },
+      });
+
+      if (recentCompletedSamePlan && recentCompletedSamePlan.completedAt) {
+        const last = new Date(recentCompletedSamePlan.completedAt).getTime();
+        const now = Date.now();
+        const elapsed = now - last;
+        const remainingMs = Math.max(0, THIRTY_DAYS_MS - elapsed);
+        if (remainingMs > 0) {
+          const err = new Error('You can purchase this plan again only after 30 days from completion');
+          err.code = 'FNO_COOLDOWN';
+          err.retryAfterSeconds = Math.ceil(remainingMs / 1000);
+          err.remainingMs = remainingMs;
+          throw err;
+        }
+      }
+    }
+
+    // decrement user balance and create transaction atomically
     await tx.user.update({
       where: { id: userId },
       data: { balance: { decrement: investmentAmount } },
