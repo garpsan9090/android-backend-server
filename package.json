@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
+    ,"auto-push": "node ./scripts/auto_push_backend.js"
   },
   "dependencies": {
     "@prisma/client": "^5.21.1",
@@ -21,7 +22,9 @@
     "node-cron": "^3.0.2",
     "nodemailer": "^7.0.0",
     "prom-client": "^14.0.1",
-    "winston": "^3.19.0"
+    "winston": "^3.19.0",
+    "otplib": "^12.0.1"
+    ,"chokidar": "^3.5.3"
   },
   "devDependencies": {
     "prisma": "^5.21.1"
