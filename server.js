@@ -581,6 +581,106 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// --- Admin endpoints (used by the admin UI served at /admin) ---
+app.post('/api/admin/signup', async (req, res) => {
+  const { username, password, creationKey } = req.body || {};
+  if (!username || !password || !creationKey) return res.status(400).json({ error: 'username, password and creationKey are required' });
+
+  const masterKey = (process.env.ADMIN_CREATION_KEY || '').trim();
+  if (!masterKey) return res.status(403).json({ error: 'Admin creation key not configured' });
+  if (creationKey !== masterKey) return res.status(403).json({ error: 'Invalid admin creation key' });
+
+  const existing = await prisma.admin.findUnique({ where: { username } });
+  if (existing) return res.status(409).json({ error: 'Username already taken' });
+
+  const hashed = await bcrypt.hash(password, 10);
+  const secretKey = crypto.randomBytes(24).toString('hex');
+  const admin = await prisma.admin.create({ data: { id: createId(), username, password: hashed, secretKey } });
+
+  return res.json({ message: 'Admin created', secretKey: admin.secretKey, adminId: admin.id });
+});
+
+app.post('/api/admin/password-reset', async (req, res) => {
+  const { username, password, secretKey } = req.body || {};
+  if (!username || !password || !secretKey) return res.status(400).json({ error: 'username, password and secretKey are required' });
+
+  const admin = await prisma.admin.findUnique({ where: { username } });
+  if (!admin) return res.status(404).json({ error: 'Admin not found' });
+
+  // allow either the admin's secretKey or the master ADMIN_CREATION_KEY to reset
+  const masterKey = (process.env.ADMIN_CREATION_KEY || '').trim();
+  if (secretKey !== admin.secretKey && secretKey !== masterKey) return res.status(403).json({ error: 'Invalid secret key' });
+
+  const hashed = await bcrypt.hash(password, 10);
+  await prisma.admin.update({ where: { id: admin.id }, data: { password: hashed } });
+  return res.json({ message: 'Password updated' });
+});
+
+app.post('/api/admin/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username and password are required' });
+
+  const admin = await prisma.admin.findUnique({ where: { username } });
+  if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const match = await bcrypt.compare(password, admin.password);
+  if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+  if (admin.twoFactorEnabled) {
+    return res.json({ requires2fa: true, adminId: admin.id });
+  }
+
+  const token = createToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  await prisma.session.create({ data: { id: createId(), email: admin.username, token, userId: null, expiresAt, updatedAt: new Date() } });
+
+  return res.json({ token, admin: { id: admin.id, username: admin.username } });
+});
+
+app.get('/api/admin/verify-session', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Invalid session' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin session' });
+  return res.json({ admin: { id: admin.id, username: admin.username } });
+});
+
+app.post('/api/admin/2fa/setup', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(404).json({ error: 'Admin not found' });
+
+  const secret = createTwoFactorSecret();
+  const otpauthUrl = createTwoFactorOtpAuthUrl(admin.username, secret);
+  await prisma.admin.update({ where: { id: admin.id }, data: { twoFactorSecret: secret } });
+  return res.json({ secret, otpauthUrl });
+});
+
+app.post('/api/admin/2fa/enable', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'Code is required' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin || !admin.twoFactorSecret) return res.status(400).json({ error: 'Two-factor not setup' });
+  if (!verifyTwoFactorCode(code, admin.twoFactorSecret)) return res.status(400).json({ error: 'Invalid code' });
+  await prisma.admin.update({ where: { id: admin.id }, data: { twoFactorEnabled: true } });
+  return res.json({ message: 'Two-factor enabled' });
+});
+
+app.post('/api/admin/2fa/verify', async (req, res) => {
+  const { adminId, code } = req.body || {};
+  if (!adminId || !code) return res.status(400).json({ error: 'adminId and code are required' });
+  const admin = await prisma.admin.findUnique({ where: { id: adminId } });
+  if (!admin || !admin.twoFactorSecret) return res.status(400).json({ error: 'Invalid admin or 2FA not configured' });
+  if (!verifyTwoFactorCode(code, admin.twoFactorSecret)) return res.status(400).json({ error: 'Invalid code' });
+  const token = createToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  await prisma.session.create({ data: { id: createId(), email: admin.username, token, userId: null, expiresAt, updatedAt: new Date() } });
+  return res.json({ token, admin: { id: admin.id, username: admin.username } });
+});
+
 app.post('/api/login', async (req, res) => {
   const { identifier, password } = req.body;
   if (!identifier || !password) {
