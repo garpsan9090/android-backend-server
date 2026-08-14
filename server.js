@@ -681,6 +681,201 @@ app.post('/api/admin/2fa/verify', async (req, res) => {
   return res.json({ token, admin: { id: admin.id, username: admin.username } });
 });
 
+// Admin data and management endpoints used by the admin UI
+app.get('/api/admin/summary', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  try {
+    const userCount = await prisma.user.count();
+    const totalBalanceRes = await prisma.user.aggregate({ _sum: { balance: true } });
+    const totalBalance = Number(totalBalanceRes._sum.balance || 0);
+    const totalDepositedRes = await prisma.transaction.aggregate({ where: { type: 'deposit', status: 'completed' }, _sum: { amount: true } });
+    const totalWithdrawnRes = await prisma.transaction.aggregate({ where: { type: 'withdraw', status: 'completed' }, _sum: { amount: true } });
+    const totalDeposited = Number(totalDepositedRes._sum.amount || 0);
+    const totalWithdrawn = Number(totalWithdrawnRes._sum.amount || 0);
+    const pendingCount = await prisma.transaction.count({ where: { OR: [{ status: 'pending' }, { verificationStatus: 'pending' }] } });
+
+    const recentPending = await prisma.transaction.findMany({ where: { OR: [{ status: 'pending' }, { verificationStatus: 'pending' }] }, orderBy: { createdAt: 'desc' }, take: 8, include: { user: true } });
+
+    return res.json({ userCount, totalBalance, totalDeposited, totalWithdrawn, pendingCount, recentPending });
+  } catch (err) {
+    console.error('[admin/summary] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to load summary' });
+  }
+});
+
+app.get('/api/admin/transactions', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  try {
+    const transactions = await prisma.transaction.findMany({ orderBy: { createdAt: 'desc' }, take: 200, include: { user: true } });
+    return res.json({ transactions });
+  } catch (err) {
+    console.error('[admin/transactions] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to load transactions' });
+  }
+});
+
+app.get('/api/admin/users', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  try {
+    const search = (req.query.search || '').toString();
+    const where = search ? { OR: [{ username: { contains: search } }, { email: { contains: search } }, { phoneNumber: { contains: search } }] } : {};
+    const users = await prisma.user.findMany({ where, orderBy: { createdAt: 'desc' }, take: 100 });
+    return res.json({ users });
+  } catch (err) {
+    console.error('[admin/users] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to load users' });
+  }
+});
+
+app.get('/api/admin/pending-transactions', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  try {
+    const pending = await prisma.transaction.findMany({ where: { OR: [{ status: 'pending' }, { verificationStatus: 'pending' }] }, orderBy: { createdAt: 'desc' }, take: 200, include: { user: true } });
+    return res.json({ transactions: pending });
+  } catch (err) {
+    console.error('[admin/pending-transactions] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to load pending transactions' });
+  }
+});
+
+app.post('/api/admin/add-balance', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  const { userId, amount, reason } = req.body || {};
+  const numeric = Number(amount || 0);
+  if (!userId || !numeric) return res.status(400).json({ error: 'userId and amount are required' });
+
+  try {
+    const user = await prisma.user.update({ where: { id: userId }, data: { balance: { increment: numeric } } });
+    await prisma.transaction.create({ data: { id: createId(), user: { connect: { id: userId } }, type: 'admin_adjust', amount: numeric, status: 'completed', description: `Admin: ${reason || 'adjustment'}`, transactionId: `ADM-${Date.now()}` } });
+    await cacheUserProfile(user).catch(() => {});
+    await cacheUserWalletBalance(user).catch(() => {});
+    return res.json({ message: 'Balance updated', balance: user.balance });
+  } catch (err) {
+    console.error('[admin/add-balance] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to update balance' });
+  }
+});
+
+app.get('/api/admin/deposit-settings', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  try {
+    const settings = await prisma.depositSetting.findFirst({ orderBy: { createdAt: 'desc' } });
+    return res.json({ settings });
+  } catch (err) {
+    console.error('[admin/deposit-settings] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to load deposit settings' });
+  }
+});
+
+app.post('/api/admin/deposit-settings', async (req, res) => {
+  // Note: admin UI posts multipart/form-data; rely on bodyParser not parsing this.
+  // For simplicity, accept JSON body as a convenience (UI uses FormData, so this route
+  // should be handled by middleware in production). We'll attempt to read fields from req.body.
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  try {
+    const { upiId, bankAccountHolder, bankAccountNumber, bankIfsc, bankName, bankBranch, instructions } = req.body || {};
+    const existing = await prisma.depositSetting.findFirst();
+    if (existing) {
+      const updated = await prisma.depositSetting.update({ where: { id: existing.id }, data: { upiId, bankAccountHolder, bankAccountNumber, bankIfsc, bankName, bankBranch, instructions, updatedAt: new Date() } });
+      return res.json({ settings: updated });
+    }
+    const created = await prisma.depositSetting.create({ data: { id: createId(), key: 'default', upiId, bankAccountHolder, bankAccountNumber, bankIfsc, bankName, bankBranch, instructions, updatedAt: new Date() } });
+    return res.json({ settings: created });
+  } catch (err) {
+    console.error('[admin/deposit-settings POST] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to save deposit settings' });
+  }
+});
+
+app.post('/api/admin/verify-transaction', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  const { transactionId, action, notes } = req.body || {};
+  if (!transactionId || !action) return res.status(400).json({ error: 'transactionId and action are required' });
+
+  try {
+    const txn = await prisma.transaction.findUnique({ where: { transactionId } });
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+
+    if (action === 'approve') {
+      await prisma.transaction.update({ where: { id: txn.id }, data: { status: 'completed', verificationStatus: 'verified', verifiedBy: admin.username, verificationNotes: notes || '' } });
+      return res.json({ message: 'Transaction approved' });
+    }
+    if (action === 'reject') {
+      await prisma.transaction.update({ where: { id: txn.id }, data: { status: 'rejected', verificationStatus: 'rejected', verifiedBy: admin.username, verificationNotes: notes || '' } });
+      return res.json({ message: 'Transaction rejected' });
+    }
+
+    return res.status(400).json({ error: 'Unknown action' });
+  } catch (err) {
+    console.error('[admin/verify-transaction] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to verify transaction' });
+  }
+});
+
+app.get('/api/admin/download-proof', async (req, res) => {
+  const session = await getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Missing admin token' });
+  const admin = await prisma.admin.findUnique({ where: { username: session.email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid admin' });
+
+  const transactionId = req.query.transactionId?.toString();
+  if (!transactionId) return res.status(400).json({ error: 'transactionId is required' });
+
+  try {
+    const txn = await prisma.transaction.findUnique({ where: { transactionId } });
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+    const proof = txn.proofUrl;
+    if (!proof) return res.status(404).json({ error: 'No proof available' });
+
+    // If proof is an absolute URL, proxy it
+    if (/^https?:\/\//i.test(proof)) {
+      const resp = await axios.get(proof, { responseType: 'arraybuffer' });
+      const contentType = resp.headers['content-type'] || 'application/octet-stream';
+      res.setHeader('Content-Type', contentType);
+      return res.send(Buffer.from(resp.data));
+    }
+
+    // Otherwise assume it's a local file path under uploads
+    const uploadPath = path.join(__dirname, 'uploads', proof);
+    return res.sendFile(uploadPath);
+  } catch (err) {
+    console.error('[admin/download-proof] error', err?.message || err);
+    return res.status(500).json({ error: 'Unable to fetch proof' });
+  }
+});
+
 app.post('/api/login', async (req, res) => {
   const { identifier, password } = req.body;
   if (!identifier || !password) {
