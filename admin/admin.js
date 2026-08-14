@@ -978,7 +978,7 @@ async function loadUsers(search = '') {
                 <td>${formatDate(user.createdAt)}</td>
                 <td><span class="status-pill approved">Active</span></td>
                 <td>${formatCurrency(user.balance || 0)}</td>
-                <td>${formatCurrency(user.balance || 0)}</td>
+                <td>${formatCurrency(user.portfolioValue || 0)}</td>
                 <td>
                   <div class="row-actions">
                     <button class="small-action" data-action="view" data-user-id="${user.id}" data-user-name="${encodeURIComponent(user.username || 'User')}">View</button>
@@ -1049,7 +1049,7 @@ function renderUserProfile(user) {
           </div>
           <div class="details-grid">
             <div><span class="detail-label">Wallet balance</span><strong>${formatCurrency(user.balance || 0)}</strong></div>
-            <div><span class="detail-label">Portfolio value</span><strong>${formatCurrency(user.balance || 0)}</strong></div>
+            <div><span class="detail-label">Portfolio value</span><strong>${formatCurrency(user.portfolioValue || 0)}</strong></div>
             <div><span class="detail-label">Total deposits</span><strong>${formatCurrency(0)}</strong></div>
             <div><span class="detail-label">Total withdrawals</span><strong>${formatCurrency(0)}</strong></div>
           </div>

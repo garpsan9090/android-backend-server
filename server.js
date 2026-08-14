@@ -705,7 +705,7 @@ app.get('/api/admin/summary', async (req, res) => {
 
     const recentPending = await prisma.transaction.findMany({ where: { OR: [{ status: 'pending' }, { verificationStatus: 'pending' }] }, orderBy: { createdAt: 'desc' }, take: 8, include: { user: true } });
 
-    return res.json({ userCount, totalBalance, totalDeposited, totalWithdrawn, pendingCount, recentPending });
+    return res.json({ userCount, totalBalance, totalDeposited, totalWithdrawn, pendingCount, totalPortfolioValue, recentPending });
   } catch (err) {
     console.error('[admin/summary] error', err?.message || err);
     return res.status(500).json({ error: 'Unable to load summary' });
@@ -737,7 +737,19 @@ app.get('/api/admin/users', async (req, res) => {
     const search = (req.query.search || '').toString();
     const where = search ? { OR: [{ username: { contains: search } }, { email: { contains: search } }, { phoneNumber: { contains: search } }] } : {};
     const users = await prisma.user.findMany({ where, orderBy: { createdAt: 'desc' }, take: 100 });
-    return res.json({ users });
+    // Attach a computed `portfolioValue` for each user so admin UI can show per-user portfolio
+    const usersWithPortfolio = [];
+    for (const user of users) {
+      try {
+        const investments = await prisma.transaction.findMany({ where: { userId: user.id, type: 'investment', investmentStatus: { in: ['Active', 'Reinvested'] } }, select: { amount: true, creditedEarnings: true } });
+        const portfolioValue = investments.reduce((s, t) => s + Number(t.amount || 0) + Number(t.creditedEarnings || 0), 0);
+        usersWithPortfolio.push(Object.assign({}, user, { portfolioValue }));
+      } catch (e) {
+        usersWithPortfolio.push(Object.assign({}, user, { portfolioValue: 0 }));
+      }
+    }
+
+    return res.json({ users: usersWithPortfolio });
   } catch (err) {
     console.error('[admin/users] error', err?.message || err);
     return res.status(500).json({ error: 'Unable to load users' });
