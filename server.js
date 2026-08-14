@@ -345,6 +345,13 @@ const OTP_MAX_VERIFY_ATTEMPTS = 5;
 app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json());
 
+// Serve the admin static UI at /admin
+const adminStaticPath = path.join(__dirname, 'admin');
+app.use('/admin', express.static(adminStaticPath));
+app.get('/admin/*', (req, res) => {
+  res.sendFile(path.join(adminStaticPath, 'index.html'));
+});
+
 function createToken() {
   return crypto.randomBytes(32).toString('hex');
 }
