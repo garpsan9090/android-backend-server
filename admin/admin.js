@@ -854,7 +854,8 @@ async function renderHome() {
     document.getElementById('stat-withdrawals').textContent = formatCurrency(summaryData.totalWithdrawn || 0);
     document.getElementById('stat-pending').textContent = Number(summaryData.pendingCount || 0).toLocaleString('en-IN');
     document.getElementById('stat-balance').textContent = formatCurrency(summaryData.totalBalance || 0);
-    document.getElementById('stat-portfolio').textContent = formatCurrency(summaryData.totalBalance || 0);
+    // Use totalPortfolioValue from server (fallback to 0)
+    document.getElementById('stat-portfolio').textContent = formatCurrency(summaryData.totalPortfolioValue || 0);
     document.getElementById('stat-today-deposits').textContent = formatCurrency(todaysDeposits.reduce((sum, tx) => sum + Number(tx.amount || 0), 0));
     document.getElementById('stat-today-withdrawals').textContent = formatCurrency(todaysWithdrawals.reduce((sum, tx) => sum + Number(tx.amount || 0), 0));
 

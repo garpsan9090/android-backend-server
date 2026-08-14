@@ -696,6 +696,11 @@ app.get('/api/admin/summary', async (req, res) => {
     const totalWithdrawnRes = await prisma.transaction.aggregate({ where: { type: 'withdraw', status: 'completed' }, _sum: { amount: true } });
     const totalDeposited = Number(totalDepositedRes._sum.amount || 0);
     const totalWithdrawn = Number(totalWithdrawnRes._sum.amount || 0);
+
+    // Compute portfolio total: sum of active/reinvested investments' current value.
+    // Use (amount + creditedEarnings) as conservative current portfolio value.
+    const investmentRows = await prisma.transaction.findMany({ where: { type: 'investment', investmentStatus: { in: ['Active', 'Reinvested'] } }, select: { amount: true, creditedEarnings: true } });
+    const totalPortfolioValue = investmentRows.reduce((sum, t) => sum + Number(t.amount || 0) + Number(t.creditedEarnings || 0), 0);
     const pendingCount = await prisma.transaction.count({ where: { OR: [{ status: 'pending' }, { verificationStatus: 'pending' }] } });
 
     const recentPending = await prisma.transaction.findMany({ where: { OR: [{ status: 'pending' }, { verificationStatus: 'pending' }] }, orderBy: { createdAt: 'desc' }, take: 8, include: { user: true } });
