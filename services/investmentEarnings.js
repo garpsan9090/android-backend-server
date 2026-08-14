@@ -510,6 +510,7 @@ async function getPortfolioSummaryForUser({ userId, referenceDate = new Date() }
       grouped[key].quantity += Number(p.quantity || 1);
       grouped[key].totalProfit = Number(grouped[key].totalProfit || 0) + Number(p.totalProfit || 0);
       grouped[key].creditedEarnings = Number(grouped[key].creditedEarnings || 0) + Number(p.creditedEarnings || 0);
+      grouped[key].totalReturn = Number(grouped[key].totalReturn || 0) + Number(p.totalReturn || 0);
       grouped[key].portfolioEarnings = Number(grouped[key].portfolioEarnings || 0) + Number(p.portfolioEarnings || 0);
       grouped[key].todayGain = Number(grouped[key].todayGain || 0) + Number(p.todayGain || 0);
       // keep earliest purchasedAt and latest expiresAt
