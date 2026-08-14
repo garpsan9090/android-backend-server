@@ -1755,14 +1755,8 @@ app.post('/api/wallet/withdraw', async (req, res) => {
     }
   }
 
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-  if (user.balance < amount) {
-    return res.status(400).json({ error: 'Insufficient balance' });
-  }
-
+  // Fast-path: atomically decrement balance and create a pending withdrawal transaction
+  // Use updateMany to ensure atomic check-and-decrement, then create transaction in same tx.
   let bankAccountId = null;
   if (paymentMethod === 'bank') {
     bankAccountId = await findOrCreateBankAccount(session.userId, bankAccount);
@@ -1771,54 +1765,51 @@ app.post('/api/wallet/withdraw', async (req, res) => {
     }
   }
 
-  const [updatedUser] = await prisma.$transaction([
-    prisma.user.update({
-      where: { id: user.id },
-      data: { balance: { decrement: amount } },
-    }),
-    prisma.transaction.create({
-      data: {
-        id: createId(),
-        type: 'withdraw',
-        amount,
-        status: 'pending',
-        paymentMethod,
-        description: 'Withdrawal request',
-        transactionId: `WDR-${Date.now()}`,
-        user: { connect: { id: user.id } },
-        investmentName: '',
-        ...(bankAccountId ? { BankAccount: { connect: { id: bankAccountId } } } : {}),
-      },
-    }),
-  ]);
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const updateRes = await tx.user.updateMany({ where: { id: session.userId, balance: { gte: amount } }, data: { balance: { decrement: amount } } });
+      if (!updateRes || updateRes.count === 0) {
+        const err = new Error('INSUFFICIENT_BALANCE');
+        err.code = 'INSUFFICIENT_BALANCE';
+        throw err;
+      }
 
-  await prisma.transaction.create({
-    data: {
-      id: createId(),
-      type: 'withdraw',
-      amount,
-      status: 'pending',
-      paymentMethod,
-      description: 'Withdrawal request',
-      transactionId: `WDR-${Date.now()}`,
-      user: { connect: { id: user.id } },
-      investmentName: '',
-      ...(bankAccountId ? { BankAccount: { connect: { id: bankAccountId } } } : {}),
-    },
-  });
+      const created = await tx.transaction.create({
+        data: {
+          id: createId(),
+          type: 'withdraw',
+          amount,
+          status: 'pending',
+          paymentMethod,
+          description: 'Withdrawal request',
+          transactionId: `WDR-${Date.now()}`,
+          user: { connect: { id: session.userId } },
+          investmentName: '',
+          ...(bankAccountId ? { BankAccount: { connect: { id: bankAccountId } } } : {}),
+        },
+      });
 
-  // Warm caches asynchronously to avoid delaying response to client
-  void Promise.all([
-    cacheUserProfile({ ...user, balance: updatedUser.balance }),
-    cacheUserWalletBalance(updatedUser),
-    cacheDel(walletTransactionsCacheKey(user.id)),
-    cacheDel(portfolioCacheKey(user.id)),
-    cacheDel(bankAccountsCacheKey(user.id)),
-  ]).catch((err) => {
-    console.warn('[cache] warm up failed after withdrawal', err?.message || err);
-  });
+      const updatedUser = await tx.user.findUnique({ where: { id: session.userId } });
+      return { updatedUser, created };
+    });
 
-  res.json({ balance: updatedUser.balance, message: 'Withdrawal request submitted' });
+    // Warm caches asynchronously; do not block response
+    void Promise.all([
+      cacheUserProfile(result.updatedUser).catch(() => {}),
+      cacheUserWalletBalance(result.updatedUser).catch(() => {}),
+      cacheDel(walletTransactionsCacheKey(session.userId)).catch(() => {}),
+      cacheDel(portfolioCacheKey(session.userId)).catch(() => {}),
+      cacheDel(bankAccountsCacheKey(session.userId)).catch(() => {}),
+    ]).catch(() => {});
+
+    return res.json({ balance: result.updatedUser.balance, message: 'Withdrawal request submitted' });
+  } catch (err) {
+    if (err && err.code === 'INSUFFICIENT_BALANCE') {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    console.error('[withdraw] unexpected error', err);
+    return res.status(500).json({ error: 'Unable to submit withdrawal request' });
+  }
 });
 
 app.use((err, req, res, next) => {
