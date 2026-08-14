@@ -547,9 +547,15 @@ function getAuthToken(req) {
 async function getSessionFromRequest(req) {
   const token = getAuthToken(req);
   if (!token) return null;
-  const session = await prisma.session.findUnique({ where: { token } });
-  if (!session || session.expiresAt < new Date()) return null;
-  return session;
+  try {
+    const session = await prisma.session.findUnique({ where: { token } });
+    if (!session || session.expiresAt < new Date()) return null;
+    return session;
+  } catch (err) {
+    console.error('[getSessionFromRequest] database error', err?.message || err);
+    // If DB is temporarily unreachable, treat as no session rather than crashing
+    return null;
+  }
 }
 
 const TOTP_ISSUER = 'Upward Investments';
@@ -782,14 +788,27 @@ app.post('/api/admin/add-balance', async (req, res) => {
   if (!userId || !numeric) return res.status(400).json({ error: 'userId and amount are required' });
 
   try {
-    const user = await prisma.user.update({ where: { id: userId }, data: { balance: { increment: numeric } } });
-    await prisma.transaction.create({ data: { id: createId(), user: { connect: { id: userId } }, type: 'admin_adjust', amount: numeric, status: 'completed', description: `Admin: ${reason || 'adjustment'}`, transactionId: `ADM-${Date.now()}` } });
-    await cacheUserProfile(user).catch(() => {});
-    await cacheUserWalletBalance(user).catch(() => {});
-    return res.json({ message: 'Balance updated', balance: user.balance });
+    // Perform update and transaction creation atomically
+    const result = await prisma.$transaction(async (tx) => {
+      const updated = await tx.user.update({ where: { id: userId }, data: { balance: { increment: numeric } } });
+      const txn = await tx.transaction.create({ data: { id: createId(), user: { connect: { id: userId } }, type: 'admin_adjust', amount: numeric, status: 'completed', description: `Admin: ${reason || 'adjustment'}`, transactionId: `ADM-${Date.now()}` } });
+      return { updated, txn };
+    });
+
+    // Warm caches asynchronously (do not fail the request if caching errors occur)
+    void Promise.all([
+      cacheUserProfile(result.updated).catch(() => {}),
+      cacheUserWalletBalance(result.updated).catch(() => {}),
+    ]).catch(() => {});
+
+    return res.json({ message: 'Balance updated', balance: result.updated.balance, transactionId: result.txn.transactionId });
   } catch (err) {
     console.error('[admin/add-balance] error', err?.message || err);
-    return res.status(500).json({ error: 'Unable to update balance' });
+    // Prisma common errors mapping
+    if (err && err.code === 'P2025') {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    return res.status(500).json({ error: err?.message || 'Unable to update balance' });
   }
 });
 

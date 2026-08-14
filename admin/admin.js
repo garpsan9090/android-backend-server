@@ -1379,7 +1379,11 @@ function showWalletForm(user) {
       if (!res.ok) {
         throw new Error(data.error || data.message || `Adjustment failed (${data.status || res.status})`);
       }
-      createToast('Wallet adjustment completed.', 'success');
+      createToast(data.message || 'Wallet adjustment completed.', 'success');
+      // Optionally show updated balance in an alert briefly
+      if (typeof data.balance !== 'undefined') {
+        showAlert(`New balance: ${formatCurrency(data.balance)}`, 'ok');
+      }
       renderWallet(user.id, user.username);
     } catch (error) {
       showAlert(error.message || 'Wallet adjustment failed');
